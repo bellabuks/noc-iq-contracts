@@ -96,6 +96,9 @@ pub enum SLAError {
     InvalidReward = 10,            // #70
     InvalidSeverity = 11,          // #70
     RetentionLimitOutOfRange = 12, // SC-013
+    DuplicateOutageInput = 13,       // SC-W5-047
+    InvalidPenaltyAmount = 14,       // SC-W5-047
+    InvalidRewardAmount = 15,         // SC-W5-047
 }
 
 // -----------------------------------------------------------------------
@@ -663,51 +666,8 @@ impl SLACalculatorContract {
     pub fn get_config_version_hash(env: Env) -> Result<u64, SLAError> {
         Self::check_version(&env)?;
         Self::compute_config_version_hash(&env)
-        let severities = Self::canonical_severities(&env);
-
-        // Polynomial rolling hash parameters for good collision resistance
-        const BASE: u64 = 91138233; // Large prime number
-        const MODULUS: u64 = (1u64 << 63) - 25; // Large prime (Mersenne-like)
-
-        let mut hash: u64 = 1; // Start with non-zero seed
-        let mut power: u64 = 1;
-
-        for sev in severities {
-            let cfg = Self::load_config(&env, &sev)?;
-
-            // Mix each field with position-dependent weights
-            let field_hash = hash
-                .wrapping_mul(BASE)
-                .wrapping_add(cfg.threshold_minutes as u64)
-                .wrapping_mul(power)
-                % MODULUS;
-
-            hash = field_hash;
-            power = power.wrapping_mul(BASE) % MODULUS;
-
-            // Add penalty_per_minute with different weight
-            hash = hash
-                .wrapping_mul(BASE)
-                .wrapping_add(cfg.penalty_per_minute as u64)
-                .wrapping_mul(power)
-                % MODULUS;
-
-            power = power.wrapping_mul(BASE) % MODULUS;
-
-            // Add reward_base with different weight
-            hash = hash
-                .wrapping_mul(BASE)
-                .wrapping_add(cfg.reward_base as u64)
-                .wrapping_mul(power)
-                % MODULUS;
-
-            power = power.wrapping_mul(BASE) % MODULUS;
-        }
-
-        // Final mixing to improve distribution
-        hash = hash.wrapping_mul(BASE).wrapping_add(0x9e3779b97f4a7c15u64) % MODULUS;
-        Ok(hash)
     }
+
 
     pub fn get_result_schema(env: Env) -> Result<SLAResultSchema, SLAError> {
         Self::check_version(&env)?;
@@ -782,13 +742,13 @@ impl SLACalculatorContract {
         // Use the current ledger timestamp so the view result matches the mutating
         // path for the same inputs executed in the same ledger, while still avoiding
         // any state writes or event emission.
-        Ok(Self::compute_result(
+        Self::compute_result(
             outage_id,
             mttr_minutes,
             &cfg,
             config_version_hash,
             env.ledger().timestamp(),
-        ))
+        )
     }
 
     // -------------------------------------------------------------------
@@ -814,7 +774,7 @@ impl SLACalculatorContract {
             &cfg,
             config_version_hash,
             env.ledger().timestamp(),
-        );
+        )?;
         let mut history: Vec<SLAResult> = env
             .storage()
             .instance()
@@ -832,7 +792,7 @@ impl SLACalculatorContract {
             // Explicit duplicate policy: same outage_id is idempotent only when
             // execution inputs resolve to the same deterministic result.
             if prev.mttr_minutes != mttr_minutes || prev.threshold_minutes != cfg.threshold_minutes {
-                panic!("duplicate outage_id with mismatched execution inputs");
+                return Err(SLAError::DuplicateOutageInput);
             }
             return Ok(prev);
         }
@@ -880,14 +840,13 @@ impl SLACalculatorContract {
     /// `config_version_hash` binds the result to the exact config snapshot used
     /// during evaluation. `recorded_at` is the ledger timestamp at call time
     /// (0 in view/audit mode).
-    /// `recorded_at` is the ledger timestamp at call time (0 in view/audit mode).
     fn compute_result(
         outage_id: Symbol,
         mttr_minutes: u32,
         cfg: &SLAConfig,
         config_version_hash: u64,
         recorded_at: u64,
-    ) -> SLAResult {
+    ) -> Result<SLAResult, SLAError> {
         let threshold = cfg.threshold_minutes;
 
         // Case 1: SLA violated → penalty
@@ -896,10 +855,10 @@ impl SLACalculatorContract {
             let penalty = overtime.saturating_mul(cfg.penalty_per_minute);
             let amount = -penalty;
             if amount >= 0 {
-                panic!("invalid penalty amount");
+                return Err(SLAError::InvalidPenaltyAmount);
             }
 
-            SLAResult {
+            Ok(SLAResult {
                 outage_id,
                 status: symbol_short!("viol"),
                 mttr_minutes,
@@ -909,7 +868,7 @@ impl SLACalculatorContract {
                 rating: symbol_short!("poor"),
                 config_version_hash,
                 recorded_at,
-            }
+            })
         } else {
             // Case 2: SLA met → reward
             let performance_ratio = if threshold == 0 {
@@ -931,10 +890,10 @@ impl SLACalculatorContract {
                 .saturating_mul(multiplier as i128)
                 .div_euclid(100);
             if reward <= 0 {
-                panic!("invalid reward amount");
+                return Err(SLAError::InvalidRewardAmount);
             }
 
-            SLAResult {
+            Ok(SLAResult {
                 outage_id,
                 status: symbol_short!("met"),
                 mttr_minutes,
@@ -944,7 +903,7 @@ impl SLACalculatorContract {
                 rating,
                 config_version_hash,
                 recorded_at,
-            }
+            })
         }
     }
 
